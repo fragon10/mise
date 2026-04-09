@@ -15,7 +15,7 @@ use crate::cmd::CmdLineRunner;
 use crate::config::{Config, Settings};
 use crate::file::{display_path, remove_all, remove_all_with_warning};
 use crate::install_context::InstallContext;
-use crate::lockfile::PlatformInfo;
+use crate::lockfile::{PlatformInfo, ProvenanceType};
 use crate::path_env::PathEnv;
 use crate::platform::Platform;
 use crate::plugins::core::CORE_PLUGINS;
@@ -681,8 +681,17 @@ pub trait Backend: Debug + Send + Sync {
             let installs = dirs::INSTALLS
                 .canonicalize()
                 .unwrap_or(dirs::INSTALLS.to_path_buf());
-            if target.starts_with(installs) {
+            if target.starts_with(&installs) {
                 return Some(path);
+            }
+            // Also check shared install directories
+            for shared_dir in env::shared_install_dirs() {
+                let shared = shared_dir
+                    .canonicalize()
+                    .unwrap_or(shared_dir.to_path_buf());
+                if target.starts_with(&shared) {
+                    return Some(path);
+                }
             }
         }
         None
@@ -971,7 +980,7 @@ pub trait Backend: Debug + Send + Sync {
     async fn install_version(
         &self,
         ctx: InstallContext,
-        tv: ToolVersion,
+        mut tv: ToolVersion,
     ) -> eyre::Result<ToolVersion> {
         // Check for --locked mode: if enabled and no lockfile URL exists, fail early
         // Exempt tool stubs from lockfile requirements since they are ephemeral
@@ -1018,6 +1027,15 @@ pub trait Backend: Debug + Send + Sync {
             plugin.is_installed_err()?;
         }
 
+        // If --force and the install path resolved to a shared dir (but wasn't explicitly
+        // set via --system/--shared), redirect to primary dir to avoid modifying shared installs.
+        if ctx.force
+            && tv.install_path.is_none()
+            && env::install_path_category(&tv.install_path()) != env::InstallPathCategory::Local
+        {
+            tv.install_path = Some(tv.ba().installs_path.join(tv.tv_pathname()));
+        }
+
         let will_uninstall = ctx.force && self.is_version_installed(&ctx.config, &tv, true);
 
         // Query backend for operation count and set up progress tracking
@@ -1061,9 +1079,15 @@ pub trait Backend: Debug + Send + Sync {
             }
         };
 
-        if tv.install_path().starts_with(*dirs::INSTALLS) {
-            // this will be false only for `install-into`
+        let install_path = tv.install_path();
+        if install_path.starts_with(*dirs::INSTALLS) {
             install_state::write_backend_meta(self.ba())?;
+        } else if env::install_path_category(&install_path) != env::InstallPathCategory::Local {
+            // For --system/--shared installs, write manifest to the target installs dir
+            if let Some(installs_dir) = install_path.parent().and_then(|p| p.parent()) {
+                let manifest = installs_dir.join(".mise-installs.toml");
+                install_state::write_backend_meta_to(self.ba(), &manifest)?;
+            }
         }
 
         self.cleanup_install_dirs(&tv);
@@ -1349,10 +1373,52 @@ pub trait Backend: Debug + Send + Sync {
     }
 
     async fn dependency_env(&self, config: &Arc<Config>) -> eyre::Result<BTreeMap<String, String>> {
-        self.dependency_toolset(config)
+        let mut env = self
+            .dependency_toolset(config)
             .await?
             .full_env(config)
-            .await
+            .await?;
+
+        // Remove mise shims from PATH to prevent infinite shim recursion when a
+        // dependency tool (e.g., go) is configured but not installed. Without this,
+        // the shim for the dependency would call `mise exec` which would call the
+        // shim again infinitely.
+        if let Some(path_val) = env.get(&*env::PATH_KEY) {
+            let paths: Vec<_> = env::split_paths(path_val).collect();
+            let original_len = paths.len();
+            #[cfg(not(windows))]
+            let filtered: Vec<_> = paths
+                .into_iter()
+                .filter(|p| p.as_path() != *dirs::SHIMS)
+                .collect();
+            #[cfg(windows)]
+            let filtered: Vec<_> = {
+                // Pre-compute once; case-insensitive + separator-normalised to handle
+                // path variations such as ~/.local/share/mise\shims vs
+                // C:\Users\user\.local\share\mise\shims
+                let shims_normalized = dirs::SHIMS
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .replace('/', "\\");
+                paths
+                    .into_iter()
+                    .filter(|p| {
+                        let expanded = file::replace_path(p);
+                        expanded.to_string_lossy().to_lowercase().replace('/', "\\")
+                            != shims_normalized
+                    })
+                    .collect()
+            };
+            if filtered.len() != original_len {
+                let joined = env::join_paths(&filtered)?;
+                env.insert(
+                    env::PATH_KEY.to_string(),
+                    joined.to_string_lossy().into_owned(),
+                );
+            }
+        }
+
+        Ok(env)
     }
 
     fn fuzzy_match_filter(&self, versions: Vec<String>, query: &str) -> Vec<String> {
@@ -1638,6 +1704,31 @@ pub fn http_install_operation_count(
         count += 1;
     }
     count
+}
+
+/// Check that the provenance type recorded in the lockfile is still enabled in settings.
+/// `is_disabled` receives the provenance type and returns `Ok(true)` when the corresponding
+/// setting is off, or `Err` for provenance types unexpected in the calling backend.
+pub fn ensure_provenance_setting_enabled(
+    tv: &ToolVersion,
+    platform_key: &str,
+    is_disabled: impl FnOnce(&ProvenanceType) -> Result<bool>,
+) -> Result<()> {
+    let provenance = tv
+        .lock_platforms
+        .get(platform_key)
+        .and_then(|pi| pi.provenance.as_ref());
+    let Some(provenance) = provenance else {
+        return Ok(());
+    };
+    if is_disabled(provenance)? {
+        return Err(eyre!(
+            "Lockfile requires {provenance} provenance for {tv} but the corresponding \
+             verification setting is disabled. This may indicate a downgrade attack. \
+             Enable the setting or update the lockfile."
+        ));
+    }
+    Ok(())
 }
 
 fn find_match_in_list(list: &[String], query: &str) -> Option<String> {

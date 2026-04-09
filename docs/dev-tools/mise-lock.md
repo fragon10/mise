@@ -1,6 +1,6 @@
 # mise.lock Lockfile
 
-`mise.lock` is a lockfile that pins exact versions and checksums of tools for reproducible environments. When enabled, mise will automatically maintain this file to ensure consistent tool versions across different machines and deployments.
+`mise.lock` is a lockfile that pins exact versions and checksums of tools for reproducible environments. Lockfiles are not created automatically—you must run `mise lock` to generate them. Once a lockfile exists, mise will keep it updated as tools are installed or upgraded.
 
 ## Overview
 
@@ -26,7 +26,7 @@ lockfile = true
 
 ## How It Works
 
-1. **Automatic Creation**: When you run `mise install` or `mise use`, mise updates `mise.lock` with the exact versions installed
+1. **Lockfile Updates**: Once a `mise.lock` file exists, running `mise install` or `mise use` updates it with the exact versions installed
 2. **Version Resolution**: If a `mise.lock` exists, mise will prefer locked versions over version ranges in `mise.toml`
 3. **Checksum Verification**: For supported backends, mise stores and verifies checksums of downloaded tools
 
@@ -63,10 +63,6 @@ options = { exe = "rg" }
 checksum = "sha256:4cf9f2741e6c465ffdb7c26f38056a59e2a2544b51f7cc128ef28337eeae4d8e"
 size = 1234567
 
-# Environment-specific version (only used when MISE_ENV=test)
-[[tools.tiny]]
-version = "2.1.0"
-env = ["test"]
 ```
 
 ### Platform Information
@@ -84,7 +80,6 @@ Each tool entry (`[[tools.name]]`) can contain:
 - **`version`** (required): The exact version of the tool
 - **`backend`** (optional): The backend used to install the tool (e.g., `core:node`, `aqua:BurntSushi/ripgrep`)
 - **`options`** (optional): Backend-specific options that identify the artifact (e.g., `{exe = "rg", matching = "musl"}`)
-- **`env`** (optional): List of environment names this version applies to (e.g., `["test", "staging"]`)
 - **`platforms`** (optional): Platform-specific metadata (checksums, URLs, sizes)
 
 ### Platform Keys
@@ -95,31 +90,31 @@ The platform key format is generally `os-arch` but can be customized by backends
 - **Backend-specific**: Some backends like Java may use more specific platform identifiers
 - **Tool-specific**: Backends like `ubi` may include additional tool-specific information in the platform key
 
-## Environment-Specific Versions
+## Environment-Specific Lockfiles
 
-When using [environment-specific configuration files](/configuration/environments) (e.g., `mise.test.toml`), tools from those files are tagged with an `env` field in the lockfile:
+When using [environment-specific configuration files](/configuration/environments) (e.g., `mise.test.toml`), each environment gets its own lockfile:
 
-```toml
-# mise.test.toml
-[tools]
-tiny = "2"
+| Config file            | Lockfile               |
+| ---------------------- | ---------------------- |
+| `mise.toml`            | `mise.lock`            |
+| `mise.test.toml`       | `mise.test.lock`       |
+| `mise.staging.toml`    | `mise.staging.lock`    |
+| `mise.local.toml`      | `mise.local.lock`      |
+| `mise.test.local.toml` | `mise.test.local.lock` |
+
+For example, with `MISE_ENV=test`:
+
+```sh
+MISE_ENV=test mise lock  # creates mise.lock AND mise.test.lock
 ```
 
-When you run `MISE_ENV=test mise use tiny@2`, the lockfile will include:
+Tools from `mise.toml` go to `mise.lock`, tools from `mise.test.toml` go to `mise.test.lock`.
 
-```toml
-[[tools.tiny]]
-version = "2.1.0"
-env = ["test"]
-```
+**Resolution**: When `MISE_ENV=test`, mise reads `mise.test.lock` for tools defined in `mise.test.toml` and `mise.lock` for tools in `mise.toml`. Environment-specific lockfiles are strictly scoped to their corresponding config — they only contain tools defined in that config.
 
-**Resolution priority**: When resolving versions, mise checks in order:
+This design means CI environments that don't set `MISE_ENV` only depend on `mise.lock`, so dev tool version bumps in `mise.dev.lock` won't invalidate CI caches.
 
-1. Entry with matching `env` for the current `MISE_ENV`
-2. Base entry (no `env` field)
-3. First available entry
-
-This allows different environments to use different tool versions while sharing the same lockfile.
+Both `mise.lock` and `mise.<env>.lock` files should be committed to version control. `mise.local.lock` and `mise.<env>.local.lock` should be gitignored alongside their corresponding config files.
 
 ## Local Lockfiles
 
@@ -166,10 +161,10 @@ This is useful for CI environments where you want to guarantee reproducible buil
 ### Initial Setup
 
 ```sh
-# Create the lockfile
-touch mise.lock
+# Generate the lockfile
+mise lock
 
-# Install tools (this will populate the lockfile)
+# Install tools using locked versions
 mise install
 ```
 
@@ -199,6 +194,8 @@ mise use node@24
 Backend support for lockfile features varies:
 
 - ✅ **Full support** (version + checksum + size + URL): `aqua`, `http`, `github`, `gitlab`
+  - _Provenance support_: `aqua`, `github`, `core:python` (precompiled binaries), `core:ruby` (precompiled binaries), `core:zig` (install-time)
+- ⚠️ **Partial support** (version + URL + provenance): `vfox` (tool plugins only)
 - ⚠️ **Partial support** (version + checksum + size): `ubi`
 - 📝 **Basic support** (version + checksum): `core` (some tools)
 - 📝 **Version only**: `asdf`, `npm`, `cargo`, `pipx`
@@ -271,8 +268,9 @@ lockfile = false
 # Convert .tool-versions to mise.toml
 mise config generate
 
-# Enable lockfiles and populate
+# Enable lockfiles and generate the lockfile
 mise settings lockfile=true
+mise lock
 mise install
 ```
 
@@ -282,6 +280,17 @@ mise install
 # Set versions based on package.json
 mise use node@$(jq -r '.engines.node' package.json)
 ```
+
+## Minimum Release Age
+
+In addition to lockfiles, mise supports the [`install_before`](/configuration/settings.html#install_before) setting to limit supply chain risk by only installing versions that have been available for a minimum amount of time:
+
+```toml
+[settings]
+install_before = "7d"  # only resolve to versions released more than 7 days ago
+```
+
+This pairs well with lockfiles — use `install_before` to avoid picking up brand-new releases, and lockfiles to pin the exact versions you've vetted.
 
 ## See Also
 

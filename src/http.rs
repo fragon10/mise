@@ -319,6 +319,9 @@ impl Client {
         file::create_dir_all(parent)?;
         let mut file = tempfile::NamedTempFile::with_prefix_in(path, parent)?;
         while let Some(chunk) = resp.chunk().await? {
+            if crate::ui::ctrlc::is_cancelled() {
+                bail!("download cancelled by user");
+            }
             file.write_all(&chunk)?;
             if let Some(pr) = pr {
                 pr.inc(chunk.len() as u64);
@@ -431,20 +434,17 @@ pub fn error_code(e: &Report) -> Option<u16> {
 }
 
 fn github_headers(url: &Url) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    if url.host_str() == Some("api.github.com")
-        && let Some(token) = &*env::GITHUB_TOKEN
-    {
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            HeaderValue::from_str(format!("Bearer {token}").as_str()).unwrap(),
-        );
-        headers.insert(
-            "x-github-api-version",
-            HeaderValue::from_static("2022-11-28"),
-        );
+    let is_github = url.host_str().is_some_and(|h| {
+        h == "api.github.com"
+            || h == "github.com"
+            || h.ends_with(".githubusercontent.com")
+            || crate::github::is_gh_host(h)
+    });
+    if is_github {
+        crate::github::get_headers(url.as_str())
+    } else {
+        HeaderMap::new()
     }
-    headers
 }
 
 /// Get HTTP Basic authentication headers from netrc file for the given URL

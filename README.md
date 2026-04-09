@@ -2,17 +2,20 @@
 
 <h1 align="center">
   <a href="https://mise.jdx.dev">
-    <img src="docs/public/logo.svg" alt="mise" width="256" height="256" />
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/public/logo-dark.svg" />
+      <img src="docs/public/logo-light.svg" alt="mise" width="256" height="256" />
+    </picture>
     <br>
     mise-en-place
   </a>
 </h1>
 
 <p>
-  <a href="https://crates.io/crates/mise"><img alt="Crates.io" src="https://img.shields.io/crates/v/mise?style=for-the-badge&color=00d9ff"></a>
-  <a href="https://github.com/jdx/mise/blob/main/LICENSE"><img alt="GitHub" src="https://img.shields.io/github/license/jdx/mise?style=for-the-badge&color=52e892"></a>
-  <a href="https://github.com/jdx/mise/actions/workflows/test.yml"><img alt="GitHub Workflow Status" src="https://img.shields.io/github/actions/workflow/status/jdx/mise/test.yml?style=for-the-badge&color=ff9100"></a>
-  <a href="https://discord.gg/mABnUDvP57"><img alt="Discord" src="https://img.shields.io/discord/1066429325269794907?style=for-the-badge&color=00d9ff"></a>
+  <a href="https://crates.io/crates/mise"><img alt="Crates.io" src="https://img.shields.io/crates/v/mise?style=for-the-badge&color=8B2252"></a>
+  <a href="https://github.com/jdx/mise/blob/main/LICENSE"><img alt="GitHub" src="https://img.shields.io/github/license/jdx/mise?style=for-the-badge&color=6B7F4E"></a>
+  <a href="https://github.com/jdx/mise/actions/workflows/test.yml"><img alt="GitHub Workflow Status" src="https://img.shields.io/github/actions/workflow/status/jdx/mise/test.yml?style=for-the-badge&color=C5975B"></a>
+  <a href="https://discord.gg/mABnUDvP57"><img alt="Discord" src="https://img.shields.io/discord/1066429325269794907?style=for-the-badge&color=8B2252"></a>
 </p>
 
 <p><b>The front-end to your dev env</b></p>
@@ -61,7 +64,7 @@ $ ~/.local/bin/mise --version
  / / / / / / (__  )  __/_____/  __/ / / /_____/ /_/ / / /_/ / /__/  __/
 /_/ /_/ /_/_/____/\___/      \___/_/ /_/     / .___/_/\__,_/\___/\___/
                                             /_/                 by @jdx
-2026.3.5 macos-arm64 (2026-03-07)
+2026.4.3 macos-arm64 (2026-04-03)
 ```
 
 Hook mise into your shell (pick the right one for your shell):

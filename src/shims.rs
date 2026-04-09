@@ -45,6 +45,15 @@ pub async fn handle_shim() -> Result<()> {
         raw: false,
         no_prepare: true, // Skip prepare for shims to avoid performance impact
         fresh_env: false,
+        deny_all: false,
+        deny_read: false,
+        deny_write: false,
+        deny_net: false,
+        deny_env: false,
+        allow_read: vec![],
+        allow_write: vec![],
+        allow_net: vec![],
+        allow_env: vec![],
     };
     time!("shim exec");
     exec.run().await?;
@@ -79,14 +88,27 @@ async fn which_shim(config: &mut Arc<Config>, bin_name: &str) -> Result<PathBuf>
         }
     }
     // fallback for "system"
+    let mise_bin = fs::canonicalize(&*env::MISE_BIN).unwrap_or_else(|_| env::MISE_BIN.clone());
+    let user_shims = fs::canonicalize(*dirs::SHIMS).unwrap_or_default();
+    let sys_shims = {
+        let p = env::MISE_SYSTEM_DATA_DIR.join("shims");
+        if p.exists() {
+            fs::canonicalize(&p).unwrap_or(p)
+        } else {
+            PathBuf::new()
+        }
+    };
     for path in &*env::PATH {
-        if fs::canonicalize(path).unwrap_or_default()
-            == fs::canonicalize(*dirs::SHIMS).unwrap_or_default()
-        {
+        let canon_path = fs::canonicalize(path).unwrap_or_default();
+        if canon_path == user_shims || canon_path == sys_shims {
             continue;
         }
         let bin = path.join(bin_name);
         if bin.exists() {
+            // Skip if this binary is a mise shim (symlink pointing to the mise binary)
+            if fs::canonicalize(&bin).unwrap_or_default() == mise_bin {
+                continue;
+            }
             trace!("shim[{bin_name}] SYSTEM {bin}", bin = display_path(&bin));
             return Ok(bin);
         }
@@ -116,10 +138,16 @@ pub async fn reshim(config: &Arc<Config>, ts: &Toolset, force: bool) -> Result<(
             .then(|| fs::read_to_string(&mode_file).unwrap_or_default())
             .is_some_and(|prev| prev.trim() != shim_mode)
     };
-    let is_windows_hardlink_or_exe =
-        cfg!(windows) && (shim_mode == "hardlink" || shim_mode == "exe");
-    if force || is_windows_hardlink_or_exe || shim_mode_changed {
-        file::remove_all(*dirs::SHIMS)?;
+    if force || shim_mode_changed {
+        // On Windows, .exe shims may be locked by processes or the shell (they
+        // are on PATH).  Instead of removing the entire directory (which fails
+        // with "Access is denied"), remove individual files with a rename-first
+        // fallback so locked executables are moved out of the way.
+        if cfg!(windows) {
+            remove_shims_individually(&dirs::SHIMS)?;
+        } else {
+            file::remove_all(*dirs::SHIMS)?;
+        }
     }
     file::create_dir_all(*dirs::SHIMS)?;
     if cfg!(windows) {
@@ -127,15 +155,33 @@ pub async fn reshim(config: &Arc<Config>, ts: &Toolset, force: bool) -> Result<(
         file::write(&mode_file, &shim_mode)?;
     }
 
-    let (shims_to_add, shims_to_remove) = get_shim_diffs(config, &mise_bin, ts).await?;
+    let (shims_to_add, shims_to_remove) = if force || shim_mode_changed {
+        // After a full wipe, all desired shims need to be re-created.
+        let desired = get_desired_shims(config, &mise_bin, ts).await?;
+        (
+            desired.into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::new(),
+        )
+    } else {
+        get_shim_diffs(config, &mise_bin, ts).await?
+    };
 
     for shim in shims_to_add {
         let symlink_path = dirs::SHIMS.join(&shim);
+        // On Windows, remove the old shim first (with rename fallback for
+        // locked .exe files) so the new one can be written.
+        if cfg!(windows) && symlink_path.exists() {
+            remove_shim_with_rename_fallback(&symlink_path)?;
+        }
         add_shim(&mise_bin, &symlink_path, &shim)?;
     }
     for shim in shims_to_remove {
         let symlink_path = dirs::SHIMS.join(shim);
-        file::remove_all(&symlink_path)?;
+        if cfg!(windows) {
+            remove_shim_with_rename_fallback(&symlink_path)?;
+        } else {
+            file::remove_all(&symlink_path)?;
+        }
     }
     let mut jset = JoinSet::new();
     for plugin in backend::list() {
@@ -157,6 +203,70 @@ pub async fn reshim(config: &Arc<Config>, ts: &Toolset, force: bool) -> Result<(
         .collect::<Result<Vec<_>>>()?;
 
     Ok(())
+}
+
+/// Remove all shim files from a directory individually, skipping dotfiles like
+/// `.mode`. Uses [`remove_shim_with_rename_fallback`] for each entry so locked
+/// `.exe` files on Windows are renamed out of the way instead of causing a
+/// hard error.
+fn remove_shims_individually(shims_dir: &Path) -> Result<()> {
+    let entries = match shims_dir.read_dir() {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(e).wrap_err_with(|| {
+                format!(
+                    "failed to read shims directory: {}",
+                    display_path(shims_dir)
+                )
+            });
+        }
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        // skip dotfiles (e.g. .mode) — these are metadata, not shims
+        if name.to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        remove_shim_with_rename_fallback(&path)?;
+    }
+    Ok(())
+}
+
+/// Remove a single shim file. On Windows, if deletion fails (e.g. because the
+/// `.exe` is locked by another process), rename it to `<name>.old` so the path
+/// is freed for a new shim. The `.old` file will be cleaned up on the next
+/// reshim or when the lock is released.
+fn remove_shim_with_rename_fallback(path: &Path) -> Result<()> {
+    // First, try to clean up any leftover .old files from a previous run.
+    let old_path = path.with_extension("old");
+    if old_path.exists() {
+        let _ = fs::remove_file(&old_path); // best-effort
+    }
+
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if cfg!(windows) && matches!(e.raw_os_error(), Some(5) | Some(32)) => {
+            // ERROR_ACCESS_DENIED (5) or ERROR_SHARING_VIOLATION (32): file is
+            // locked by another process, rename it instead.
+            trace!(
+                "cannot delete locked shim {}, renaming to .old",
+                display_path(path)
+            );
+            fs::rename(path, &old_path).wrap_err_with(|| {
+                format!(
+                    "failed to rename locked shim {} to {}",
+                    display_path(path),
+                    display_path(&old_path)
+                )
+            })?;
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).wrap_err_with(|| format!("failed to remove shim: {}", display_path(path))),
+    }
 }
 
 #[cfg(windows)]

@@ -62,7 +62,7 @@ pub mod task_tool_installer;
 
 pub use task_load_context::{TaskLoadContext, expand_colon_task_syntax};
 pub use task_output::TaskOutput;
-pub use task_script_parser::has_any_args_defined;
+pub use task_script_parser::{has_any_args_defined, has_any_usage_spec};
 pub use task_template::TaskTemplate;
 
 use crate::config::config_file::ConfigFile;
@@ -74,15 +74,47 @@ pub use deps::{Deps, TaskKey};
 use task_dep::TaskDep;
 use task_sources::{RawOutputTemplates, TaskOutputs};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RunEntry {
     /// Shell script entry
     Script(String),
-    /// Run a single task with optional args
-    SingleTask { task: String },
+    /// Run a single task with optional args and env
+    SingleTask {
+        task: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
+        #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+        env: IndexMap<String, String>,
+    },
     /// Run multiple tasks in parallel
     TaskGroup { tasks: Vec<String> },
+}
+
+impl std::hash::Hash for RunEntry {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            RunEntry::Script(s) => {
+                0u8.hash(state);
+                s.hash(state);
+            }
+            RunEntry::SingleTask { task, args, env } => {
+                1u8.hash(state);
+                task.hash(state);
+                args.hash(state);
+                let mut pairs: Vec<_> = env.iter().collect();
+                pairs.sort_by_key(|(k, _)| k.as_str());
+                for (k, v) in pairs {
+                    k.hash(state);
+                    v.hash(state);
+                }
+            }
+            RunEntry::TaskGroup { tasks } => {
+                2u8.hash(state);
+                tasks.hash(state);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
@@ -199,7 +231,16 @@ impl Display for RunEntry {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             RunEntry::Script(s) => write!(f, "{}", s),
-            RunEntry::SingleTask { task } => write!(f, "task: {task}"),
+            RunEntry::SingleTask { task, args, env } => {
+                for (k, v) in env {
+                    write!(f, "{}={} ", k, v)?;
+                }
+                write!(f, "task: {task}")?;
+                if !args.is_empty() {
+                    write!(f, " {}", args.join(" "))?;
+                }
+                Ok(())
+            }
             RunEntry::TaskGroup { tasks } => write!(f, "tasks: {}", tasks.join(", ")),
         }
     }
@@ -290,9 +331,42 @@ pub struct Task {
     #[serde(skip)]
     pub remote_file_source: Option<String>,
 
+    /// Block reads, writes, network, and env vars
+    #[serde(default)]
+    pub deny_all: bool,
+    /// Block filesystem reads
+    #[serde(default)]
+    pub deny_read: bool,
+    /// Block all filesystem writes
+    #[serde(default)]
+    pub deny_write: bool,
+    /// Block all network access
+    #[serde(default)]
+    pub deny_net: bool,
+    /// Block env var inheritance
+    #[serde(default)]
+    pub deny_env: bool,
+    /// Allow reads from specific paths
+    #[serde(default)]
+    pub allow_read: Vec<std::path::PathBuf>,
+    /// Allow writes to specific paths
+    #[serde(default)]
+    pub allow_write: Vec<std::path::PathBuf>,
+    /// Allow network to specific hosts
+    #[serde(default)]
+    pub allow_net: Vec<String>,
+    /// Allow specific env vars through
+    #[serde(default)]
+    pub allow_env: Vec<String>,
+
     /// Name of the task template to extend (requires experimental = true)
     #[serde(default)]
     pub extends: Option<String>,
+
+    /// When true, include args in the output prefix to disambiguate tasks
+    /// with the same display_name but different arguments.
+    #[serde(skip)]
+    pub show_args_in_prefix: bool,
 }
 
 impl Task {
@@ -315,7 +389,8 @@ impl Task {
         let info = file::read_to_string(path)?
             .lines()
             .filter_map(|line| {
-                regex!(r"^(?:#|//|::)(?:MISE| ?\[MISE\]) ([a-z0-9_.-]+=[^\n]+)$").captures(line)
+                regex!(r"^(?:#|//|::)(?:MISE| ?\[MISE\]) ([a-z0-9_.-]+\s*=\s*[^\n]+)$")
+                    .captures(line)
             })
             .map(|captures| captures.extract().1)
             .map(|[toml]| {
@@ -516,7 +591,14 @@ impl Task {
     }
 
     pub fn prefix(&self) -> String {
-        format!("[{}]", self.display_name)
+        let max_width = 40;
+        let inner = if self.show_args_in_prefix && !self.args.is_empty() {
+            let s = format!("{} {}", self.display_name, self.args.join(" "));
+            s.trim().to_string()
+        } else {
+            self.display_name.clone()
+        };
+        format!("[{}]", console::truncate_str(&inner, max_width, "…"))
     }
 
     pub fn run(&self) -> &Vec<RunEntry> {
@@ -881,8 +963,11 @@ impl Task {
         }
 
         let task_dir = task_cf.get_path().parent().unwrap_or(task_cf.get_path());
-        let config_paths = crate::config::load_config_hierarchy_from_dir(task_dir)?;
-        let task_config_files = crate::config::load_config_files_from_paths(&config_paths).await?;
+        let (config_paths, idiomatic_filenames) =
+            crate::config::load_config_hierarchy_from_dir(task_dir).await?;
+        let task_config_files =
+            crate::config::load_config_files_from_paths(&config_paths, &idiomatic_filenames)
+                .await?;
         let vars_results =
             crate::config::resolve_vars_from_config_files(config, &task_config_files).await?;
         let vars: IndexMap<String, String> = vars_results
@@ -1045,6 +1130,19 @@ impl Task {
             },
         )
         .await?;
+        // Register task-specific redactions with the global redactor
+        // Include config-level redaction patterns so they also cover task-specific env vars
+        let redact_keys = config
+            .redaction_keys()
+            .into_iter()
+            .chain(env_results.redactions.iter().cloned());
+        let task_env_map: EnvMap = env_results
+            .env
+            .iter()
+            .map(|(k, (v, _))| (k.clone(), v.clone()))
+            .collect();
+        config.add_redactions(redact_keys, &task_env_map);
+
         let task_env = env_results.env.into_iter().map(|(k, (v, _))| (k, v));
         // Apply the resolved environment variables
         env.extend(task_env.clone());
@@ -1086,11 +1184,12 @@ fn name_from_path(prefix: impl AsRef<Path>, path: impl AsRef<Path>) -> Result<St
         .map(ffi::OsStr::to_string_lossy)
         .map(|s| s.replace(':', "_"))
         .join(":");
-    if let Some(name) = name.strip_suffix(":_default") {
-        Ok(name.to_string())
-    } else {
-        Ok(name)
+    if let Some((parent, last)) = name.rsplit_once(':')
+        && strip_extension(last) == "_default"
+    {
+        return Ok(parent.to_string());
     }
+    Ok(name)
 }
 
 /// Extract monorepo path from a task name
@@ -1263,7 +1362,17 @@ impl Default for Task {
             usage: "".to_string(),
             timeout: None,
             remote_file_source: None,
+            deny_all: false,
+            deny_read: false,
+            deny_write: false,
+            deny_net: false,
+            deny_env: false,
+            allow_read: vec![],
+            allow_write: vec![],
+            allow_net: vec![],
+            allow_env: vec![],
             extends: None,
+            show_args_in_prefix: false,
         }
     }
 }
@@ -1607,6 +1716,11 @@ mod tests {
             (("/.mise/tasks", "/.mise/tasks/a/b/c"), "a:b:c"),
             (("/.mise/tasks", "/.mise/tasks/a:b"), "a_b"),
             (("/.mise/tasks", "/.mise/tasks/a:b/c"), "a_b:c"),
+            (("/.mise/tasks", "/.mise/tasks/a/_default"), "a"),
+            (("/.mise/tasks", "/.mise/tasks/a/_default.sh"), "a"),
+            (("/.mise/tasks", "/.mise/tasks/a/_default.js"), "a"),
+            (("/.mise/tasks", "/.mise/tasks/a/b/_default"), "a:b"),
+            (("/.mise/tasks", "/.mise/tasks/a/b/_default.sh"), "a:b"),
         ];
 
         for ((root, path), expected) in test_cases {
@@ -1694,6 +1808,37 @@ echo "hello world"
         expected.aliases = vec!["b".to_string()];
         expected.sources = vec!["Cargo.toml".to_string(), "src/**/*.rs".to_string()];
         assert_eq!(result.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_from_path_env_file_with_spaces_around_equals() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        let config = Config::get().await.unwrap();
+        let ts = config.get_toolset().await.unwrap();
+        let temp_dir = tempdir().unwrap();
+        let task_path = temp_dir.path().join("hello");
+        let env_path = temp_dir.path().join("env.yaml");
+
+        fs::write(&env_path, "USR: World!\n").unwrap();
+        fs::write(
+            &task_path,
+            r#"#!/usr/bin/env bash
+#MISE env._.file = "env.yaml"
+echo "Hello $USR"
+"#,
+        )
+        .unwrap();
+
+        let task = Task::from_path(&config, &task_path, temp_dir.path(), temp_dir.path())
+            .await
+            .unwrap();
+        let (env, task_env) = task.render_env(&config, ts).await.unwrap();
+
+        assert_eq!(task_env, vec![("USR".to_string(), "World!".to_string())]);
+        assert_eq!(env.get("USR"), Some(&"World!".to_string()));
     }
 
     #[tokio::test]
@@ -2454,5 +2599,43 @@ echo "test"
         // Bare name "test" should still match the "test" task (implicit wildcard)
         let matches = tasks.get_matching("test").unwrap();
         assert!(matches.contains(&&"test".to_string()));
+    }
+
+    #[test]
+    fn test_get_matching_resolves_aliases() {
+        use std::collections::BTreeMap;
+
+        use super::GetMatchingExt;
+
+        let mut tasks: BTreeMap<String, String> = BTreeMap::new();
+        tasks.insert("pr:remove".to_string(), "pr:remove".to_string());
+        tasks.insert("prr".to_string(), "pr:remove".to_string());
+
+        let matches = tasks.get_matching("prr").unwrap();
+        assert_eq!(matches, vec![&"pr:remove".to_string()]);
+
+        let matches = tasks.get_matching("pr:remove").unwrap();
+        assert_eq!(matches, vec![&"pr:remove".to_string()]);
+    }
+
+    #[test]
+    fn test_get_matching_resolves_monorepo_aliases() {
+        use std::collections::BTreeMap;
+
+        use super::GetMatchingExt;
+
+        let mut tasks: BTreeMap<String, String> = BTreeMap::new();
+        tasks.insert("//:pr:remove".to_string(), "//:pr:remove".to_string());
+        tasks.insert("//:prr".to_string(), "//:pr:remove".to_string());
+        tasks.insert("prr".to_string(), "//:pr:remove".to_string());
+
+        let matches = tasks.get_matching("//:prr").unwrap();
+        assert_eq!(matches, vec![&"//:pr:remove".to_string()]);
+
+        let matches = tasks.get_matching("prr").unwrap();
+        assert_eq!(matches, vec![&"//:pr:remove".to_string()]);
+
+        let matches = tasks.get_matching("//:pr:remove").unwrap();
+        assert_eq!(matches, vec![&"//:pr:remove".to_string()]);
     }
 }

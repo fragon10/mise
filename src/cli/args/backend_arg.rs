@@ -86,13 +86,17 @@ impl From<InstallStateTool> for BackendArg {
             }
         }
 
-        Self::new_raw(
+        let mut tool = Self::new_raw(
             short,
             ist.full,
             tool_name,
             opts,
             BackendResolution::new(ist.explicit_backend),
-        )
+        );
+        if let Some(installs_path) = ist.installs_path {
+            tool.installs_path = installs_path;
+        }
+        tool
     }
 }
 
@@ -156,6 +160,16 @@ impl BackendArg {
             resolution,
             // backend: Default::default(),
         }
+    }
+
+    /// Returns the kebab-cased directory name used for this tool's install path.
+    /// This is the canonical name used on the filesystem (e.g. "github-user-repo").
+    pub fn tool_dir_name(&self) -> String {
+        self.installs_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string()
     }
 
     pub fn backend(&self) -> Result<ABackend> {

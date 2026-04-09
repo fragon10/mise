@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
-use crate::config::Config;
+use crate::config::{self, Config};
+use crate::dirs;
 use crate::file::display_rel_path;
 use crate::task::Task;
 use crate::task::task_fetcher::TaskFetcher;
+use crate::task::task_list::find_non_executable_task_files;
 use crate::ui::table::MiseTable;
 use comfy_table::{Attribute, Cell, Row};
 use eyre::Result;
@@ -105,9 +107,9 @@ impl TasksLs {
             None
         };
 
-        let tasks = config
-            .tasks_with_context(ctx.as_ref())
-            .await?
+        let all_tasks = config.tasks_with_context(ctx.as_ref()).await?;
+
+        let tasks = all_tasks
             .values()
             .filter(|t| self.hidden || !t.hide)
             .filter(|t| !self.local || !t.global)
@@ -121,6 +123,20 @@ impl TasksLs {
         // always pass no_cache=false as the command doesn't take no-cache argument
         // MISE_TASK_REMOTE_NO_CACHE env var is still respected if set
         TaskFetcher::new(false).fetch_tasks(&mut tasks).await?;
+
+        // Warn about non-executable files only when there are truly no tasks at all
+        // (not just filtered out by --hidden/--local/--global)
+        if all_tasks.is_empty()
+            && !cfg!(windows)
+            && let Some(cwd) = &*dirs::CWD
+        {
+            let includes = config::task_includes_for_dir(cwd, &config.config_files);
+            if !find_non_executable_task_files(&includes).is_empty() {
+                warn!(
+                    "no tasks found, but non-executable files exist in task directories.\nFiles must be executable to be detected as tasks. Run `chmod +x` on the task files to fix this."
+                );
+            }
+        }
 
         if self.complete {
             return self.complete(tasks);
@@ -138,7 +154,7 @@ impl TasksLs {
         for t in tasks {
             let name = t.display_name.replace(":", "\\:");
             let description = t.description.replace(":", "\\:");
-            println!("{name}:{description}",);
+            calm_io::stdoutln!("{name}:{description}")?;
         }
         Ok(())
     }
@@ -164,6 +180,24 @@ impl TasksLs {
             let mut task_spec = task.parse_usage_spec_for_display(config).await?;
             for (name, complete) in task_spec.complete {
                 task_spec.cmd.complete.insert(name, complete);
+            }
+            // Ensure that completions after -- work.
+            task_spec.cmd.args.push(
+                usage::SpecArgBuilder::new()
+                    .name("-- ARGS_LAST")
+                    .help("Arguments to pass to the tasks. Use \":::\" to separate tasks.")
+                    .hide(true)
+                    .var(true)
+                    .build(),
+            );
+            if let Some(path) = crate::task::extract_monorepo_path(&task.display_name) {
+                let prefixed_aliases: Vec<String> = task_spec
+                    .cmd
+                    .aliases
+                    .iter()
+                    .map(|a| format!("//{}:{}", path, a))
+                    .collect();
+                task_spec.cmd.aliases.extend(prefixed_aliases);
             }
             usage
                 .cmd

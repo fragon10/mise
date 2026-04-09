@@ -16,14 +16,14 @@ export default withMermaid(
     description: "mise-en-place documentation",
     lang: "en-US",
     lastUpdated: true,
-    appearance: "dark",
+    appearance: true,
     mermaid: {},
     sitemap: {
       hostname: "https://mise.jdx.dev",
     },
     themeConfig: {
       // https://vitepress.dev/reference/default-theme-config
-      logo: "/logo.svg",
+      logo: { light: "/logo-light.svg", dark: "/logo-dark.svg" },
       outline: "deep",
       nav: [
         { text: "mise-versions", link: "https://mise-versions.jdx.dev/" },
@@ -66,6 +66,7 @@ export default withMermaid(
             { text: "Tool Aliases", link: "/dev-tools/aliases" },
             { text: "Tool Stubs", link: "/dev-tools/tool-stubs" },
             { text: "Registry", link: "/registry" },
+            { text: "GitHub Tokens", link: "/dev-tools/github-tokens" },
             { text: "mise.lock Lockfile", link: "/dev-tools/mise-lock" },
             { text: "Prepare", link: "/dev-tools/prepare" },
             {
@@ -146,6 +147,7 @@ export default withMermaid(
             { text: "Task Configuration", link: "/tasks/task-configuration" },
             { text: "Task Templates", link: "/tasks/templates" },
             { text: "Monorepo Tasks", link: "/tasks/monorepo" },
+            { text: "Sandboxing", link: "/sandboxing" },
           ],
         },
         {
@@ -308,7 +310,7 @@ export default withMermaid(
           sizes: "32x32",
         },
       ],
-      ["link", { rel: "icon", href: "/logo.svg", type: "image/svg+xml" }],
+      ["link", { rel: "icon", href: "/favicon.svg", type: "image/svg+xml" }],
       [
         "link",
         {
@@ -336,7 +338,7 @@ export default withMermaid(
       [
         "link",
         {
-          href: "https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@300;400;500;600;700;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap",
+          href: "https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;0,700;1,300;1,400&family=DM+Sans:ital,opsz,wght@0,9..40,100..1000;1,9..40,100..1000&family=JetBrains+Mono:wght@400;500;600;700&display=swap",
           rel: "stylesheet",
         },
       ],

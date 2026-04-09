@@ -9,16 +9,17 @@ All examples are in toml-task format instead of file, however they apply in both
 
 ### `run`
 
-- **Type**: `string | (string | { task: string } | { tasks: string[] })[]`
+- **Type**: `string | (string | { task: string, args?: string[], env?: { [key]: string } } | { tasks: string[] })[]`
 
 The command(s) to run. This is the only required property for a task.
 
-You can now mix scripts with task references:
+You can mix scripts with task references, and pass optional `args` and `env` to referenced tasks:
 
 ```mise-toml
 [tasks.grouped]
 run = [
   { task = "t1" },          # run t1 (with its dependencies)
+  { task = "build", args = ["--release"], env = { RUSTFLAGS = "-C opt-level=3" } },
   { tasks = ["t2", "t3"] }, # run t2 and t3 in parallel (with their dependencies)
   "echo end",               # then run a script
 ]
@@ -38,7 +39,7 @@ run = ["echo hello"]
 
 ### `run_windows`
 
-- **Type**: `string | (string | { task: string } | { tasks: string[] })[]`
+- **Type**: `string | (string | { task: string, args?: string[], env?: { [key]: string } } | { tasks: string[] })[]`
 
 Windows-specific variant of `run` supporting the same structured syntax:
 
@@ -259,6 +260,16 @@ this that no other tasks are running at the same time.
 
 In the future we could have a property like `single = true` or something that prevents multiple tasks
 from running at the same time. If that sounds useful, search/file a ticket.
+
+### `interactive`
+
+- **Type**: `bool`
+- **Default**: `false`
+
+Connects the task directly to the shell's stdin/stdout/stderr. Interactive tasks acquire an exclusive lock,
+ensuring sole access to standard I/O — while an interactive task is running, all other tasks (both interactive
+and non-interactive) are blocked. Non-interactive tasks can still run in parallel with each other. This is more
+targeted than the broad `raw` setting which forces single-threaded execution globally (by setting `jobs = 1`).
 
 ### `sources`
 

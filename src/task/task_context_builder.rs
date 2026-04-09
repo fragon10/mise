@@ -95,7 +95,8 @@ impl TaskContextBuilder {
                 task_dir.display()
             );
 
-            let config_paths = crate::config::load_config_hierarchy_from_dir(task_dir)?;
+            let (config_paths, idiomatic_filenames) =
+                crate::config::load_config_hierarchy_from_dir(task_dir).await?;
             trace!(
                 "task {} found {} config files in hierarchy",
                 task.name,
@@ -103,7 +104,8 @@ impl TaskContextBuilder {
             );
 
             let task_config_files =
-                crate::config::load_config_files_from_paths(&config_paths).await?;
+                crate::config::load_config_files_from_paths(&config_paths, &idiomatic_filenames)
+                    .await?;
 
             let task_ts = ToolsetBuilder::new()
                 .with_config_files(task_config_files)
@@ -170,10 +172,14 @@ impl TaskContextBuilder {
                 task_dir.display()
             );
 
-            let config_paths = crate::config::load_config_hierarchy_from_dir(task_dir)?;
+            let (config_paths, idiomatic_filenames) =
+                crate::config::load_config_hierarchy_from_dir(task_dir).await?;
             trace!("Found {} config files in hierarchy", config_paths.len());
 
-            Some(crate::config::load_config_files_from_paths(&config_paths).await?)
+            Some(
+                crate::config::load_config_files_from_paths(&config_paths, &idiomatic_filenames)
+                    .await?,
+            )
         } else {
             None
         };
@@ -246,6 +252,11 @@ impl TaskContextBuilder {
             .await?;
         Self::apply_env_results(&mut env, &config_env_results);
 
+        // Register config-level redactions resolved through the task context
+        if !config_env_results.redactions.is_empty() {
+            config.add_redactions(config_env_results.redactions.iter().cloned(), &env);
+        }
+
         let task_env_directives = self.build_task_env_directives(task);
         let task_env_results = self
             .resolve_env_directives(config, &tera_ctx, &env, task_env_directives)
@@ -253,6 +264,15 @@ impl TaskContextBuilder {
 
         let task_env = self.extract_task_env(&task_env_results);
         Self::apply_env_results(&mut env, &task_env_results);
+
+        // Register task-specific redactions with the global redactor
+        // Include both task-level redact=true keys and config-level redaction patterns
+        // so that config-level `redactions = ["PATTERN"]` also covers task-specific env vars
+        let task_redact_keys = config
+            .redaction_keys()
+            .into_iter()
+            .chain(task_env_results.redactions.iter().cloned());
+        config.add_redactions(task_redact_keys, &env);
 
         // Cache the result if no task-specific env directives or tools
         if task.env.0.is_empty() && task.inherited_env.0.is_empty() && task.tools.is_empty() {
